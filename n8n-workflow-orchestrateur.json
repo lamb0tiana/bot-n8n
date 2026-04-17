@@ -1,0 +1,191 @@
+{
+  "name": "Orchestrateur Messenger × Supabase",
+  "nodes": [
+    {
+      "id": "node-01-webhook",
+      "name": "Réception message",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "parameters": {
+        "path": "messenger",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "notes": "Body attendu : { \"message\": \"avez vous un tshirt\", \"session_id\": \"user_123\" }"
+    },
+    {
+      "id": "node-02-init-session",
+      "name": "Init Session",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "parameters": {
+        "jsCode": "// Extraire le corps de la requête\nconst body = $input.first().json.body ?? $input.first().json;\nconst message = body.message ?? '';\nconst sessionId = body.session_id ?? 'default';\n\n// Charger la session depuis le static data du workflow\nconst store = $getWorkflowStaticData('global');\nif (!store.sessions) store.sessions = {};\n\nconst session = store.sessions[sessionId] ?? {\n  produit_actif: null,\n  produits_recents: [],\n  derniere_requete_produit: null,\n  dernier_statut_recherche: null,\n  dernier_resultat_recherche: null,\n  produits_deja_envoyes: [],\n  derniere_limite_recherche: 5\n};\n\nreturn [{ json: { message, session_id: sessionId, session } }];"
+      }
+    },
+    {
+      "id": "node-03-model-orchestrateur",
+      "name": "Claude Sonnet (Orchestrateur)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [460, 520],
+      "parameters": {
+        "model": "claude-sonnet-4-6",
+        "options": {
+          "maxTokensToSample": 4096
+        }
+      },
+      "credentials": {
+        "anthropicApi": {
+          "id": "1",
+          "name": "Anthropic API"
+        }
+      }
+    },
+    {
+      "id": "node-04-tool-embed",
+      "name": "embed_text",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1,
+      "position": [680, 520],
+      "parameters": {
+        "name": "embed_text",
+        "description": "Vectorise un texte via OpenAI text-embedding-3-small. Retourne un tableau JSON de 1536 floats. Utiliser pour toute nouvelle recherche produit.",
+        "jsCode": "const text = $fromAI('text', 'Le texte à vectoriser (requête produit du client)', 'string');\n\nconst response = await $helpers.httpRequest({\n  method: 'POST',\n  url: 'https://api.openai.com/v1/embeddings',\n  headers: {\n    'Authorization': `Bearer ${$env.OPENAI_API_KEY}`,\n    'Content-Type': 'application/json'\n  },\n  body: JSON.stringify({\n    model: 'text-embedding-3-small',\n    input: text,\n    dimensions: 1536\n  })\n});\n\n// Retourner le vecteur sérialisé (l'agent le passera à match_images)\nreturn JSON.stringify(response.data[0].embedding);"
+      }
+    },
+    {
+      "id": "node-05-tool-supabase",
+      "name": "match_images",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1,
+      "position": [880, 520],
+      "parameters": {
+        "name": "match_images",
+        "description": "Recherche vectorielle de produits dans Supabase. Prend le JSON string de l'embedding retourné par embed_text, un seuil (défaut 0.2) et un nombre max de résultats (défaut 5). Retourne la liste des produits correspondants.",
+        "jsCode": "const embeddingStr = $fromAI('embedding_json', 'Le JSON string du tableau de 1536 floats retourné par embed_text', 'string');\nconst matchThreshold = $fromAI('match_threshold', 'Seuil de similarité cosine (défaut 0.2)', 'number') ?? 0.2;\nconst matchCount = $fromAI('match_count', 'Nombre maximum de résultats à retourner (défaut 5, max 20)', 'number') ?? 5;\n\nconst embedding = JSON.parse(embeddingStr);\n\nconst SUPABASE_URL = 'https://ymdngagxbpjqanczloyv.supabase.co';\nconst ANON_KEY = $env.SUPABASE_ANON_KEY;\n\nconst response = await $helpers.httpRequest({\n  method: 'POST',\n  url: `${SUPABASE_URL}/rest/v1/rpc/match_images`,\n  headers: {\n    'apikey': ANON_KEY,\n    'Authorization': `Bearer ${ANON_KEY}`,\n    'Content-Type': 'application/json'\n  },\n  body: JSON.stringify({\n    query_embedding: embedding,\n    match_threshold: matchThreshold,\n    match_count: matchCount\n  })\n});\n\nreturn JSON.stringify(response);"
+      }
+    },
+    {
+      "id": "node-06-agent-orchestrateur",
+      "name": "Agent Orchestrateur",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [680, 300],
+      "parameters": {
+        "promptType": "define",
+        "text": "=Message client : {{ $json.message }}\n\nMémoire de session actuelle (JSON) :\n{{ JSON.stringify($json.session, null, 2) }}",
+        "options": {
+          "systemMessage": "Tu es un agent orchestrateur pour un bot de vente Messenger. Tu ne réponds JAMAIS directement au client.\n\nTon unique rôle : analyser le message, résoudre le contexte, rechercher les produits si nécessaire, puis retourner un payload JSON structuré.\n\n═══════════════════════════════════════\nÉTAPE 1 — CLASSIFICATION\n═══════════════════════════════════════\nClasser le message en :\n- TYPE A : Produit / intention d'achat (prix, dispo, couleur, taille, commande)\n  - A1 : référence à un produit déjà en mémoire (\"c'est combien celui-là ?\")\n  - A2 : nouvelle recherche explicite (\"je cherche un t-shirt rouge\")\n  - A3 : continuité / variantes (\"t'as pas autre chose ?\", \"montre-moi plus\")\n  - A4 : intention d'achat (\"je le prends\", \"je veux commander\")\n- TYPE B : Demande générale (livraison, paiement, adresse, horaires)\n- TYPE C : Image envoyée (avec ou sans texte)\n- TYPE D : Message ambigu sans résolution fiable\n\n═══════════════════════════════════════\nÉTAPE 2 — RÉSOLUTION CONTEXTE\n═══════════════════════════════════════\nExtraire les attributs : couleur, taille, pointure, prix, modèle, matière.\nParcourir la mémoire par priorité : produit_actif → produits_recents.\nSi attribut = couleur ou taille : croiser OBLIGATOIREMENT avec la catégorie active.\nSi plusieurs candidats plausibles → clarification_requise (jamais de choix arbitraire).\n\n═══════════════════════════════════════\nÉTAPE 3 — CHECKPOINT (avant tout appel Supabase)\n═══════════════════════════════════════\nVérifier dans l'ordre :\n□ produit_actif identifiable depuis la mémoire ?\n□ produits_recents couvrent la demande (attributs + catégorie cohérents) ?\n□ derniere_requete_produit couvre la demande actuelle ?\n→ Au moins une case cochée → résoudre depuis mémoire, NE PAS appeler les outils\n→ Aucune case cochée → appliquer la règle de court-circuit :\n\nCAS 1 — Même produit, même sémantique (formulation différente)\n   Ex : derniere_requete=\"tshirt\" → nouvelle=\"t shirt\" → retourner dernier_resultat_recherche directement\nCAS 2 — Même produit, attribut nouveau ou différent\n   Ex : derniere_requete=\"tshirt\" → nouvelle=\"t-shirt rouge\"\n   → Filtrer dernier_resultat_recherche sur le nouvel attribut\n   → Si résultats après filtrage → retourner le sous-ensemble, PAS d'appel Supabase\n   → Si aucun résultat → lancer recherche avec requête combinée\nCAS 3 — Produit différent → nouvelle recherche\n\n═══════════════════════════════════════\nÉTAPE 4 — RECHERCHE SUPABASE (si CAS 3 ou filtrage vide)\n═══════════════════════════════════════\n1. Appeler embed_text avec la requête produit extraite\n2. Appeler match_images avec l'embedding JSON retourné (match_threshold=0.2, match_count=5 par défaut)\n   Pour TYPE A3 : match_count = min(derniere_limite_recherche + 5, 20)\nSi résultat vide → statut aucun_produit, ne pas tenter d'autres appels.\n\n═══════════════════════════════════════\nÉTAPE 5 — VALIDATION\n═══════════════════════════════════════\nExtraire les mots-clés significatifs de la requête (ignorer : \"prix\", \"combien\", \"avez-vous\", \"je veux\", \"montre\", \"cherche\").\nVérifier que les mots-clés apparaissent dans titre/description/catégorie/attributs du produit.\nSi score élevé sans cohérence métier → rejeter. En cas de doute → aucun_produit.\n\n═══════════════════════════════════════\nÉTAPE 6 — CONSTRUCTION DU PAYLOAD\n═══════════════════════════════════════\nRetourner UNIQUEMENT un objet JSON valide, sans texte avant ni après.\n\nTYPE A1/A2 :\n{\n  \"type\": \"resultat_recherche\",\n  \"status\": \"produit_trouve | produit_multiple | aucun_produit | clarification_requise\",\n  \"produit_reference\": { \"id\": \"...\", \"nom\": \"...\", \"source_resolution\": \"memoire | historique | recherche | null\" },\n  \"produits\": [{ \"id\": \"...\", \"description\": \"...\", \"upload_id\": \"...\", \"similarity\": 0.0 }],\n  \"attributs_detectes\": { \"couleur\": null, \"taille\": null, \"pointure\": null, \"prix\": null, \"quantite\": null },\n  \"intention_achat\": \"non\",\n  \"message_client_original\": \"...\",\n  \"raison_clarification\": null,\n  \"session_update\": { ... }\n}\n\nTYPE A3 : même structure + \"continuite\": true, \"requete_reutilisee\": \"...\"\nTYPE A4 : même structure avec \"intention_achat\": \"oui\"\nTYPE B : { \"type\": \"demande_generale\", \"message_client_original\": \"...\", \"contexte_produit_actif\": { \"id\": null, \"nom\": null } }\nTYPE C : { \"type\": \"resultat_recherche_image\", \"status\": \"...\", \"description_image\": \"...\", \"produits\": [...], \"intention_achat\": \"non\", \"message_client_original\": \"...\" }\nTYPE D : { \"type\": \"clarification\", \"message_client_original\": \"...\", \"raison\": \"...\", \"contexte_candidats\": [] }\n\nChamp session_update OBLIGATOIRE dans TOUS les types :\n{\n  \"session_update\": {\n    \"produit_actif\": null,\n    \"produits_recents\": [],\n    \"derniere_requete_produit\": null,\n    \"dernier_statut_recherche\": null,\n    \"dernier_resultat_recherche\": null,\n    \"produits_deja_envoyes\": [],\n    \"derniere_limite_recherche\": 5\n  }\n}\n\nInclure dans session_update UNIQUEMENT les champs modifiés par ce tour de conversation."
+        }
+      }
+    },
+    {
+      "id": "node-07-update-session",
+      "name": "MAJ Session + Extraire Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300],
+      "parameters": {
+        "jsCode": "const agentOutput = $input.first().json.output ?? '';\n\n// Parser le JSON retourné par l'orchestrateur\nlet payload;\ntry {\n  // Nettoyer les balises markdown si présentes\n  const cleaned = agentOutput.replace(/```json\\n?/g, '').replace(/```\\n?/g, '').trim();\n  payload = JSON.parse(cleaned);\n} catch (e) {\n  payload = {\n    type: 'erreur_parse',\n    message: 'Impossible de parser la sortie orchestrateur : ' + e.message,\n    raw: agentOutput\n  };\n}\n\n// Mettre à jour la session dans le static data\nconst sessionId = $('Init Session').first().json.session_id;\nconst store = $getWorkflowStaticData('global');\nif (!store.sessions) store.sessions = {};\n\nconst currentSession = store.sessions[sessionId] ?? {};\nconst update = payload.session_update ?? {};\n\nif (update.produit_actif !== undefined) currentSession.produit_actif = update.produit_actif;\nif (update.produits_recents?.length) currentSession.produits_recents = update.produits_recents.slice(-5);\nif (update.derniere_requete_produit) currentSession.derniere_requete_produit = update.derniere_requete_produit;\nif (update.dernier_statut_recherche) currentSession.dernier_statut_recherche = update.dernier_statut_recherche;\nif (update.dernier_resultat_recherche) currentSession.dernier_resultat_recherche = update.dernier_resultat_recherche;\nif (update.produits_deja_envoyes) currentSession.produits_deja_envoyes = update.produits_deja_envoyes;\nif (update.derniere_limite_recherche) currentSession.derniere_limite_recherche = update.derniere_limite_recherche;\n\nstore.sessions[sessionId] = currentSession;\n\n// Retirer session_update du payload final\ndelete payload.session_update;\n\nreturn [{ json: { payload, session_id: sessionId } }];"
+      }
+    },
+    {
+      "id": "node-08-model-assistant",
+      "name": "Claude Haiku (Assistant)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [1120, 520],
+      "parameters": {
+        "model": "claude-haiku-4-5-20251001",
+        "options": {
+          "maxTokensToSample": 1024
+        }
+      },
+      "credentials": {
+        "anthropicApi": {
+          "id": "1",
+          "name": "Anthropic API"
+        }
+      }
+    },
+    {
+      "id": "node-09-agent-assistant",
+      "name": "Module Assistant",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [1120, 300],
+      "parameters": {
+        "promptType": "define",
+        "text": "=Payload de l'orchestrateur :\n{{ JSON.stringify($json.payload, null, 2) }}",
+        "options": {
+          "systemMessage": "Tu es l'assistant commercial d'une boutique sur Messenger. Tu rédiges les réponses destinées aux clients à partir du payload fourni par l'orchestrateur.\n\nRègles :\n- Réponse courte, naturelle, commerciale (2-4 phrases max)\n- Langue : malagasy si le message original est en malagasy, français sinon\n- Ne jamais inventer de prix, stock ou information non présente dans le payload\n\nSelon le status :\n- produit_trouve + 1 produit → présenter le produit (description)\n- produit_multiple → lister les options brièvement et demander laquelle\n- aucun_produit → s'excuser, proposer une autre recherche ou une alternative\n- clarification_requise → poser la question de clarification (raison_clarification)\n- demande_generale → répondre à la question générale (tu n'as pas l'info → inviter à contacter directement)\n- intention_achat=oui → confirmer et guider vers la commande\n\nRetourner UNIQUEMENT le texte de la réponse, sans guillemets ni balises."
+        }
+      }
+    },
+    {
+      "id": "node-10-respond",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1340, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"response\": $json.output, \"payload\": $('MAJ Session + Extraire Payload').first().json.payload, \"session_id\": $('MAJ Session + Extraire Payload').first().json.session_id } }}"
+      }
+    }
+  ],
+  "connections": {
+    "Réception message": {
+      "main": [
+        [{ "node": "Init Session", "type": "main", "index": 0 }]
+      ]
+    },
+    "Init Session": {
+      "main": [
+        [{ "node": "Agent Orchestrateur", "type": "main", "index": 0 }]
+      ]
+    },
+    "Claude Sonnet (Orchestrateur)": {
+      "ai_languageModel": [
+        [{ "node": "Agent Orchestrateur", "type": "ai_languageModel", "index": 0 }]
+      ]
+    },
+    "embed_text": {
+      "ai_tool": [
+        [{ "node": "Agent Orchestrateur", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "match_images": {
+      "ai_tool": [
+        [{ "node": "Agent Orchestrateur", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "Agent Orchestrateur": {
+      "main": [
+        [{ "node": "MAJ Session + Extraire Payload", "type": "main", "index": 0 }]
+      ]
+    },
+    "MAJ Session + Extraire Payload": {
+      "main": [
+        [{ "node": "Module Assistant", "type": "main", "index": 0 }]
+      ]
+    },
+    "Claude Haiku (Assistant)": {
+      "ai_languageModel": [
+        [{ "node": "Module Assistant", "type": "ai_languageModel", "index": 0 }]
+      ]
+    },
+    "Module Assistant": {
+      "main": [
+        [{ "node": "Respond to Webhook", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

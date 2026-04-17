@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "supabase": {
+      "type": "http",
+      "url": "https://mcp.supabase.com/mcp?project_ref=ymdngagxbpjqanczloyv"
+    },
+    "embedding-server": {
+      "command": "node",
+      "args": ["./index.js"],
+      "env": {
+        "OPENAI_API_KEY": "XXX"
+      }
+    },
+    "n8n-mcp": {
+      "command": "npx",
+      "args": ["n8n-mcp"],
+      "env": {
+        "MCP_MODE": "stdio"
+      }
+    }
+  }
+}
