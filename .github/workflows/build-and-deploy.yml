@@ -1,0 +1,54 @@
+name: 'Build and deploy lamb0tiana/bot-n8n'
+'on':
+  push:
+    branches:
+      - '**'
+  delete: null
+permissions:
+  contents: read
+jobs:
+  preview:
+    if: "github.event_name == 'push' && !github.event.deleted && github.ref_name != 'master'"
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: 'preview-${{ github.ref_name }}'
+      cancel-in-progress: false
+    steps:
+      - name: 'Deploy the preview'
+        env:
+          SSH_HOST: '${{ secrets.SSH_HOST }}'
+          SSH_PORT: '${{ secrets.SSH_PORT }}'
+          SSH_USER: '${{ secrets.SSH_USER }}'
+          SSHPASS: '${{ secrets.SSH_PASSWORD }}'
+          GITHUB_TOKEN: '${{ github.token }}'
+        run: 'printf ''%s\n'' "$GITHUB_TOKEN" "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" | sshpass -e ssh -o StrictHostKeyChecking=accept-new -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" ''if [ -f deployment/scripts/deploy.sh ]; then bash deployment/scripts/deploy.sh preview; else echo "~/deployment/scripts/deploy.sh absent : connectez-vous au serveur depuis EVA Pilote, rien n''\''''est déployé."; fi'''
+  production:
+    if: "github.event_name == 'push' && !github.event.deleted && github.ref_name == 'master'"
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: production
+      cancel-in-progress: false
+    steps:
+      - name: 'Deploy the production'
+        env:
+          SSH_HOST: '${{ secrets.SSH_HOST }}'
+          SSH_PORT: '${{ secrets.SSH_PORT }}'
+          SSH_USER: '${{ secrets.SSH_USER }}'
+          SSHPASS: '${{ secrets.SSH_PASSWORD }}'
+          GITHUB_TOKEN: '${{ github.token }}'
+        run: 'printf ''%s\n'' "$GITHUB_TOKEN" "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" | sshpass -e ssh -o StrictHostKeyChecking=accept-new -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" ''if [ -f deployment/scripts/deploy.sh ]; then bash deployment/scripts/deploy.sh production; else echo "~/deployment/scripts/deploy.sh absent : connectez-vous au serveur depuis EVA Pilote, rien n''\''''est déployé."; fi'''
+  remove-preview:
+    if: "github.event_name == 'delete' && github.event.ref_type == 'branch'"
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: 'preview-${{ github.event.ref }}'
+      cancel-in-progress: false
+    steps:
+      - name: 'Remove the preview'
+        env:
+          SSH_HOST: '${{ secrets.SSH_HOST }}'
+          SSH_PORT: '${{ secrets.SSH_PORT }}'
+          SSH_USER: '${{ secrets.SSH_USER }}'
+          SSHPASS: '${{ secrets.SSH_PASSWORD }}'
+          DELETED_BRANCH: '${{ github.event.ref }}'
+        run: 'printf ''%s\n'' "" "$GITHUB_REPOSITORY" "$DELETED_BRANCH" "" | sshpass -e ssh -o StrictHostKeyChecking=accept-new -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" ''if [ -f deployment/scripts/deploy.sh ]; then bash deployment/scripts/deploy.sh remove-preview; else echo "~/deployment/scripts/deploy.sh absent : connectez-vous au serveur depuis EVA Pilote, rien n''\''''est déployé."; fi'''
