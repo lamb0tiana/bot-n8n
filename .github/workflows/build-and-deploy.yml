@@ -1,4 +1,4 @@
-name: 'Build and deploy lamb0tiana/bot-n8n'
+name: 'Build and deploy lamb0tiana/bot-n8ns'
 'on':
   push:
     branches:
